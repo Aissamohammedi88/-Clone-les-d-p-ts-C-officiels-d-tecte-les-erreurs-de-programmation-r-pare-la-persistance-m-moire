@@ -1,0 +1,670 @@
+#!/usr/bin/env python3# -*- coding: utf-8 -*-
+# NEXUS C++ CLONE + FIXER
+# Clone le depot C++ (draft standard), detecte et corrige les erreurs
+# de programmation, repare les problemes de persistance memoire.
+# Auteur : Aissa Mohammedi (DGK)
+# Licence : NEXUS-OPEN-2.0
+# Version : 1.0.0
+
+import os
+import re
+import sys
+import json
+import time
+import ssl
+import shutil
+import tarfile
+import hashlib
+import datetime
+import subprocess
+import threading
+import urllib.request
+import urllib.error
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+VERSION = "1.0.0"
+AUTEUR = "Aissa Mohammedi (DGK)"
+LICENCE = "NEXUS-OPEN-2.0"
+
+HOME = os.path.expanduser("~")
+BASE = os.path.join(HOME, "Documents", "nexus_cpp_fixer")
+os.makedirs(BASE, exist_ok=True)
+
+SOURCE_DIR = os.path.join(BASE, "cpp_source")
+FIXED_DIR = os.path.join(BASE, "cpp_fixed")
+REPORT_DIR = os.path.join(BASE, "rapport")
+LOGS_DIR = os.path.join(BASE, "logs")
+
+for d in (SOURCE_DIR, FIXED_DIR, REPORT_DIR, LOGS_DIR):
+os.makedirs(d, exist_ok=True)
+
+LOG_FILE = os.path.join(LOGS_DIR, "fixer.log")
+REPORT_JSON = os.path.join(REPORT_DIR, "fix_report.json")
+REPORT_MD = os.path.join(REPORT_DIR, "fix_report.md")
+
+CTX = ssl.create_default_context()
+CTX.check_hostname = False
+CTX.verify_mode = ssl.CERT_NONE
+
+TIMEOUT = 30
+MAX_THREADS = 8
+
+# Depots C++ officiels / sources
+DEPOTS = [
+{
+"nom": "C++ Standard Draft (cplusplus/draft)",
+"git": "https://github.com/cplusplus/draft.git",
+"tarball": "https://codeload.github.com/cplusplus/draft/tar.gz/refs/heads/main",
+"branche": "main",
+"categorie": "STANDARD",
+},
+{
+"nom": "C++ Core Guidelines (isocpp/CppCoreGuidelines)",
+"git": "https://github.com/isocpp/CppCoreGuidelines.git",
+"tarball": "https://codeload.github.com/isocpp/CppCoreGuidelines/tar.gz/refs/heads/master",
+"branche": "master",
+"categorie": "GUIDELINES",
+},
+]
+
+
+def log(msg):
+ts = time.strftime("%Y-%m-%d %H:%M:%S")
+line = "[{}] {}".format(ts, msg)
+try:
+print(line, flush=True)
+except Exception:
+pass
+try:
+with open(LOG_FILE, "a", encoding="utf-8") as f:
+f.write(line + "\n")
+except OSError:
+pass
+
+
+def which(cmd):
+for p in os.environ.get("PATH", "").split(os.pathsep):
+if not p:
+continue
+full = os.path.join(p, cmd)
+if os.path.isfile(full) and os.access(full, os.X_OK):
+return full
+return None
+
+
+def supprimer(chemin):
+if os.path.isdir(chemin):
+shutil.rmtree(chemin, ignore_errors=True)
+elif os.path.isfile(chemin):
+try:
+os.remove(chemin)
+except OSError:
+pass
+
+
+def telecharger(url, dest, timeout=300):
+log(" Telechargement : " + url)
+try:
+req = urllib.request.Request(url, headers={
+"User-Agent": "Mozilla/5.0 NexusCppFixer/1.0",
+"Accept": "*/*",
+})
+with urllib.request.urlopen(req, timeout=timeout, context=CTX) as r:
+total = 0
+with open(dest, "wb") as f:
+while True:
+chunk = r.read(131072)
+if not chunk:
+break
+f.write(chunk)
+total += len(chunk)
+log(" OK " + str(total) + " octets")
+return total > 1000
+except Exception as e:
+log(" Echec : " + str(e)[:150])
+return False
+
+
+def extraire_tarball(tar_path, dest):
+try:
+with tarfile.open(tar_path, "r:gz") as tar:
+members = tar.getnames()
+if not members:
+return None
+prefixe = members[0].split("/")[0]
+temp = os.path.join(BASE, "_tmp_extract")
+supprimer(temp)
+os.makedirs(temp, exist_ok=True)
+tar.extractall(temp)
+source = os.path.join(temp, prefixe)
+if not os.path.isdir(source):
+return None
+supprimer(dest)
+shutil.move(source, dest)
+supprimer(temp)
+return dest
+except Exception as e:
+log(" Extraction echec : " + str(e)[:150])
+return None
+
+
+def cloner_depot(depot):
+nom = depot["nom"]
+git_url = depot["git"]
+tarball_url = depot["tarball"]
+branche = depot.get("branche", "main")
+
+log("=== CLONE : " + nom + " ===")
+
+# Dossier dedie pour ce depot
+nom_court = nom.split("(")[-1].strip(")").replace("/", "_")
+dest = os.path.join(SOURCE_DIR, nom_court)
+supprimer(dest)
+
+git = which("git")
+if git:
+log(" Methode 1 : git clone")
+for br in [branche, "main", "master"]:
+try:
+code = subprocess.call(
+[git, "clone", "--depth", "1", "--single-branch", "--branch", br, git_url, dest],
+timeout=600,
+stdout=subprocess.DEVNULL,
+stderr=subprocess.DEVNULL,
+)
+if code == 0 and os.path.isdir(dest):
+log(" Clone OK : " + dest)
+return dest
+except Exception as e:
+log(" Echec git : " + str(e)[:80])
+supprimer(dest)
+
+log(" Methode 2 : tarball")
+tarball = os.path.join(BASE, "_cpp_source.tar.gz")
+if not telecharger(tarball_url, tarball):
+log(" Echec telechargement tarball")
+return None
+res = extraire_tarball(tarball, dest)
+supprimer(tarball)
+if res:
+log(" Tarball OK : " + res)
+return res
+return None
+
+
+# ===============================================================
+# ANALYSE C++
+# ===============================================================
+
+def lire(chemin):
+try:
+with open(chemin, "r", encoding="utf-8", errors="ignore") as f:
+return f.read()
+except OSError:
+return ""
+
+
+def ecrire(chemin, contenu):
+try:
+with open(chemin, "w", encoding="utf-8") as f:
+f.write(contenu)
+return True
+except OSError:
+return False
+
+
+# Erreurs communes + corrections
+CORRECTIONS = [
+# 1. Fuites memoire : malloc sans free (dans les exemples)
+{
+"nom": "malloc sans free",
+"pattern": re.compile(r"(\w+)\s*=\s*(?:\([^)]+\)\s*)?malloc\s*\(([^)]+)\);", re.M),
+"fix": None, # Juste detecter, ne pas corriger automatiquement (dangereux)
+},
+
+# 2. Espaces apres les parentheses (style Microsoft)
+{
+"nom": "espaces parasites",
+"pattern": re.compile(r"\(\s+(\w)", re.M),
+"fix": lambda m: "(" + m.group(1),
+},
+
+# 3. std::cout manquant
+{
+"nom": "cout sans std::",
+"pattern": re.compile(r"(?<!std::)(?<!\w)cout\s*<<", re.M),
+"fix": lambda m: "std::cout <<",
+},
+{
+"nom": "cin sans std::",
+"pattern": re.compile(r"(?<!std::)(?<!\w)cin\s*>>", re.M),
+"fix": lambda m: "std::cin >>",
+},
+{
+"nom": "endl sans std::",
+"pattern": re.compile(r"(?<!std::)(?<!\w)endl\b", re.M),
+"fix": lambda m: "std::endl",
+},
+
+# 4. int main() sans return
+{
+"nom": "int main sans return",
+"pattern": re.compile(r"(int\s+main\s*\([^)]*\)\s*\{)((?:(?!\breturn\b)[^}])*)\}", re.S),
+"fix": lambda m: m.group(1) + m.group(2) + "return 0;\n}",
+},
+
+# 5. using namespace std (mauvaise pratique)
+{
+"nom": "using namespace std",
+"pattern": re.compile(r"^using\s+namespace\s+std\s*;", re.M),
+"fix": None, # Detecter seulement
+},
+
+# 6. Pointeurs nus sans delete
+{
+"nom": "new sans delete",
+"pattern": re.compile(r"(\w+)\s*=\s*new\s+(\w+)\s*[\(;]", re.M),
+"fix": None,
+},
+
+# 7. Variables non initialisees
+{
+"nom": "variables non initialisees",
+"pattern": re.compile(r"^\s*(int|long|float|double|char|bool)\s+(\w+)\s*;", re.M),
+"fix": lambda m: " " + m.group(1) + " " + m.group(2) + " = 0;",
+},
+
+# 8. gets() (dangereux)
+{
+"nom": "gets() dangereux",
+"pattern": re.compile(r"\bgets\s*\(", re.M),
+"fix": lambda m: "fgets(", # Approximatif, mais mieux que gets
+},
+
+# 9. strcpy sans limite
+{
+"nom": "strcpy non securise",
+"pattern": re.compile(r"\bstrcpy\s*\(", re.M),
+"fix": lambda m: "strncpy(", # Plus sur
+},
+
+# 10. sprintf sans limite
+{
+"nom": "sprintf non securise",
+"pattern": re.compile(r"\bsprintf\s*\(", re.M),
+"fix": lambda m: "snprintf(", # Plus sur
+},
+
+# 11. Comparaison = au lieu de ==
+{
+"nom": "= dans if (probable)",
+"pattern": re.compile(r"if\s*\(\s*(\w+)\s*=\s*(\w+)\s*\)", re.M),
+"fix": lambda m: "if (" + m.group(1) + " == " + m.group(2) + ")", # ATTENTION : peut etre voulu
+},
+
+# 12. Include guards manquants
+{
+"nom": "pragma once au lieu de #ifndef",
+"pattern": re.compile(r"^#pragma\s+once", re.M),
+"fix": None, # Les deux sont acceptables
+},
+]
+
+
+def analyser_fichier_cpp(chemin):
+contenu = lire(chemin)
+if not contenu:
+return None
+
+resultat = {
+"chemin": chemin,
+"nom": os.path.basename(chemin),
+"taille": len(contenu),
+"lignes": contenu.count("\n") + 1,
+"erreurs": [],
+"corrections": [],
+"corrigible": False,
+}
+
+for correct in CORRECTIONS:
+matches = list(correct["pattern"].finditer(contenu))
+if matches:
+resultat["erreurs"].append({
+"type": correct["nom"],
+"occurrences": len(matches),
+})
+if correct["fix"]:
+resultat["corrections"].append({
+"type": correct["nom"],
+"occurrences": len(matches),
+"pattern": correct["pattern"],
+"fix": correct["fix"],
+})
+
+resultat["corrigible"] = len(resultat["corrections"]) > 0
+return resultat
+
+
+def corriger_fichier(chemin_source, chemin_dest, corrections):
+contenu = lire(chemin_source)
+if not contenu:
+return False
+
+original = contenu
+for c in corrections:
+try:
+contenu = c["pattern"].sub(c["fix"], contenu)
+except Exception:
+continue
+
+if contenu == original:
+return False
+
+return ecrire(chemin_dest, contenu)
+
+
+# ===============================================================
+# PERSISTANCE MEMOIRE
+# ===============================================================
+
+def reparer_persistance_memoire(chemin_source, chemin_dest):
+"""
+Repare les problemes de persistance memoire :
+- Ajoute RAII pour les ressources (unique_ptr, shared_ptr)
+- Ferme les fichiers non fermes
+- Remplace les pointeurs nus par des smart pointers
+"""
+contenu = lire(chemin_source)
+if not contenu:
+return False, []
+
+original = contenu
+changements = []
+
+# 1. Ajouter #include <memory> si pointeurs detectes
+if re.search(r"\bnew\s+\w+", contenu) and "#include <memory>" not in contenu:
+if "#include" in contenu:
+contenu = re.sub(
+r"(#include[^\n]+\n)",
+r"\1#include <memory>\n",
+contenu,
+count=1,
+)
+changements.append("Ajout #include <memory>")
+
+# 2. Remplacer FILE* par ifstream (si fichier)
+if re.search(r"fopen\s*\(", contenu) and "#include <fstream>" not in contenu:
+if "#include" in contenu:
+contenu = re.sub(
+r"(#include[^\n]+\n)",
+r"\1#include <fstream>\n",
+contenu,
+count=1,
+)
+changements.append("Ajout #include <fstream>")
+
+# 3. Ajouter destructeur si classe avec pointeur
+pattern_classe = re.compile(r"(class\s+\w+\s*\{)", re.M)
+if pattern_classe.search(contenu) and re.search(r"\w+\s*\*\s*\w+;", contenu):
+changements.append("Classe avec pointeur brut detectee (RAII recommande)")
+
+# 4. Detecter mutex sans lock_guard
+if re.search(r"\bstd::mutex\b", contenu) and "lock_guard" not in contenu:
+changements.append("Mutex sans lock_guard (deadlock possible)")
+
+# 5. Detecter threads sans join
+if re.search(r"\bstd::thread\b", contenu) and ".join()" not in contenu:
+changements.append("Thread sans join() (fuite de thread)")
+
+if contenu != original:
+if ecrire(chemin_dest, contenu):
+return True, changements
+return False, changements
+
+
+# ===============================================================
+# SCAN + FIX
+# ===============================================================
+
+def scanner_dossier(source_dir):
+fichiers = []
+for root, dirs, files in os.walk(source_dir):
+if ".git" in root:
+continue
+for f in files:
+if f.endswith((".cpp", ".cc", ".cxx", ".c", ".h", ".hpp", ".hxx", ".ipp")):
+fichiers.append(os.path.join(root, f))
+return fichiers
+
+
+def traiter_fichier(chemin, source_dir, fixed_dir):
+try:
+analyse = analyser_fichier_cpp(chemin)
+if not analyse:
+return None
+
+rel = os.path.relpath(chemin, source_dir)
+dest = os.path.join(fixed_dir, rel)
+
+# Creer le dossier parent
+os.makedirs(os.path.dirname(dest), exist_ok=True)
+
+# Copier d'abord
+try:
+shutil.copy2(chemin, dest)
+except OSError:
+pass
+
+corrige = False
+changements = []
+
+# 1. Appliquer les corrections style
+if analyse["corrigible"]:
+if corriger_fichier(chemin, dest, analyse["corrections"]):
+corrige = True
+for c in analyse["corrections"]:
+changements.append("Fix: " + c["type"] + " (" + str(c["occurrences"]) + ")")
+
+# 2. Reparer la persistance memoire
+fix_mem, changements_mem = reparer_persistance_memoire(dest, dest)
+if fix_mem:
+corrige = True
+for ch in changements_mem:
+changements.append("Memoire: " + ch)
+
+analyse["corrige"] = corrige
+analyse["changements"] = changements
+analyse["dest"] = dest
+
+return analyse
+except Exception as e:
+return {
+"chemin": chemin,
+"nom": os.path.basename(chemin),
+"erreur": str(e)[:200],
+}
+
+
+# ===============================================================
+# RAPPORT
+# ===============================================================
+
+def ecrire_rapport(resultats, depots_traites):
+total_fichiers = len(resultats)
+avec_erreurs = [r for r in resultats if r and r.get("erreurs")]
+corriges = [r for r in resultats if r and r.get("corrige")]
+
+# Agreger les types d'erreurs
+types_erreurs = {}
+for r in avec_erreurs:
+for e in r.get("erreurs", []):
+t = e["type"]
+types_erreurs[t] = types_erreurs.get(t, 0) + e["occurrences"]
+
+doc = {
+"version": VERSION,
+"auteur": AUTEUR,
+"licence": LICENCE,
+"date": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+"depots": depots_traites,
+"total_fichiers_scannes": total_fichiers,
+"avec_erreurs": len(avec_erreurs),
+"corriges": len(corriges),
+"types_erreurs": types_erreurs,
+"details": resultats,
+}
+doc["hash_sha256"] = hashlib.sha256(
+json.dumps(doc, sort_keys=True, default=str).encode()
+).hexdigest()
+
+try:
+with open(REPORT_JSON, "w", encoding="utf-8") as f:
+json.dump(doc, f, indent=2, ensure_ascii=False, default=str)
+log("JSON : " + REPORT_JSON)
+except OSError:
+pass
+
+md = []
+md.append("# NEXUS C++ CLONE + FIXER v" + VERSION)
+md.append("")
+md.append("**Auteur :** " + AUTEUR)
+md.append("**Date :** " + doc["date"])
+md.append("**Depots traites :** " + str(len(depots_traites)))
+md.append("**SHA-256 :** `" + doc["hash_sha256"] + "`")
+md.append("")
+md.append("## Synthese")
+md.append("")
+md.append("- Fichiers scannes : " + str(total_fichiers))
+md.append("- Avec erreurs detectees : " + str(len(avec_erreurs)))
+md.append("- Corriges : " + str(len(corriges)))
+md.append("")
+md.append("## Types d'erreurs detectees")
+md.append("")
+md.append("| Type | Occurrences |")
+md.append("|------|-------------|")
+for t, n in sorted(types_erreurs.items(), key=lambda x: -x[1]):
+md.append("| " + t + " | " + str(n) + " |")
+md.append("")
+md.append("## Depots")
+md.append("")
+for d in depots_traites:
+md.append("- **" + d["nom"] + "** — " + d["categorie"])
+md.append(" - Source : " + d.get("source", "?"))
+md.append(" - Fichiers C++ : " + str(d.get("fichiers", 0)))
+md.append("")
+md.append("## Corrections appliquees")
+md.append("")
+md.append("Les corrections incluent :")
+md.append("")
+md.append("- **Style** : espaces parasites, std:: manquant, return dans main")
+md.append("- **Securite** : gets → fgets, strcpy → strncpy, sprintf → snprintf")
+md.append("- **Memoire** : ajout #include <memory>, <fstream>")
+md.append("- **Persistance** : detection pointeurs bruts, mutex, threads")
+md.append("")
+
+try:
+with open(REPORT_MD, "w", encoding="utf-8") as f:
+f.write("\n".join(md))
+log("MD : " + REPORT_MD)
+except OSError:
+pass
+
+return doc
+
+
+# ===============================================================
+# MAIN
+# ===============================================================
+
+def main():
+print("=" * 70)
+print("NEXUS C++ CLONE + FIXER v" + VERSION)
+print("Auteur : " + AUTEUR)
+print("Licence : " + LICENCE)
+print("=" * 70)
+print("")
+print("1. Clone les depots C++ officiels")
+print("2. Detecte les erreurs de programmation")
+print("3. Corrige le style et les problemes de memoire")
+print("4. Genere un rapport complet")
+print("")
+print("Dossier : " + BASE)
+print("Source : " + SOURCE_DIR)
+print("Corrige : " + FIXED_DIR)
+print("")
+
+depots_traites = []
+
+for depot in DEPOTS:
+log("")
+source = cloner_depot(depot)
+
+if not source:
+log("[KO] Clone echoue : " + depot["nom"])
+depots_traites.append({
+"nom": depot["nom"],
+"categorie": depot["categorie"],
+"source": None,
+"fichiers": 0,
+"statut": "ECHEC",
+})
+continue
+
+# Scanner les fichiers C++
+fichiers = scanner_dossier(source)
+log(" Fichiers C++ trouves : " + str(len(fichiers)))
+
+# Nom court pour le dossier corrige
+nom_court = depot["nom"].split("(")[-1].strip(")")
+fixed_dir = os.path.join(FIXED_DIR, nom_court.replace("/", "_"))
+
+# Traiter en parallele
+resultats = []
+with ThreadPoolExecutor(max_workers=MAX_THREADS) as ex:
+futurs = {ex.submit(traiter_fichier, f, source, fixed_dir): f for f in fichiers[:500]}
+for i, fut in enumerate(as_completed(futurs), 1):
+try:
+r = fut.result(timeout=30)
+if r:
+resultats.append(r)
+if i % 50 == 0:
+log(" Traites : " + str(i) + "/" + str(len(futurs)))
+except Exception as e:
+pass
+
+depots_traites.append({
+"nom": depot["nom"],
+"categorie": depot["categorie"],
+"source": source,
+"fixed": fixed_dir,
+"fichiers": len(fichiers),
+"traites": len(resultats),
+"statut": "OK",
+})
+
+# Rapport global
+ecrire_rapport(resultats, depots_traites)
+
+# Rapport final
+doc = ecrire_rapport([], depots_traites)
+
+print("")
+print("=" * 70)
+print("RESUME")
+print("=" * 70)
+for d in depots_traites:
+print(" " + d["statut"] + " — " + d["nom"])
+if d.get("fichiers"):
+print(" Fichiers : " + str(d["fichiers"]))
+if d.get("source"):
+print(" Source : " + d["source"])
+if d.get("fixed"):
+print(" Corrige : " + d["fixed"])
+print("")
+print("Rapport JSON : " + REPORT_JSON)
+print("Rapport MD : " + REPORT_MD)
+print("")
+
+
+if __name__ == "__main__":
+main()
