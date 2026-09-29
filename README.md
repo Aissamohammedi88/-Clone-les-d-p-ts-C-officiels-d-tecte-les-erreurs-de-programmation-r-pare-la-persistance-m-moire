@@ -1,0 +1,2 @@
+# -Clone-les-d-p-ts-C-officiels-d-tecte-les-erreurs-de-programmation-r-pare-la-persistance-m-moire
+[Qu'est-ce que c'est ?](#quest-ce-que-cest-) - [Ce que le script fait](#ce-que-le-script-fait) - [Dépôts analysés](#dépôts-analysés) - [12 types d'erreurs détectées](#12-types-derreurs-détectées) - [Réparation de la persistance mémoire](#réparation-de-la-persistance-mémoire) - [Installation](#installation) - [Utilisation](#utilisation)
